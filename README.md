@@ -253,10 +253,19 @@ prior iteration's error (any level). See [**Autonomy levels**](#3-a-fully-autono
 above for what each means.
 
 ```bash
-# Autonomous self-correction (L3) with a local model
+# L3 joint self-localization diagnostic (no separate verification gate)
 python -m thought_ics.eval.batch_eval \
     --autonomy-level 3 --dataset math500 --model llama8b \
     --gpus 0,1 --tensor-parallel-size 2 --n-problems 100
+
+# Table 4 autonomous protocol. --verify gives Thought-ICS-S; adding the
+# confidence safeguard selects Thought-ICS-A. The result files report the
+# paired S and A accuracies from the same sampled trajectories.
+python -m thought_ics.eval.batch_eval \
+    --autonomy-level 3 --verify --confidence-safeguard \
+    --prompt-profile paper \
+    --dataset amc23 --model qwen32b \
+    --gpus 0,1,2,3 --tensor-parallel-size 4 --n-problems 40
 
 # Oracle-verification setting (L2): model is told it's wrong and must self-localize
 python -m thought_ics.eval.batch_eval \
@@ -298,6 +307,10 @@ The equivalent CLI options are `--3p-api-key`, `--3p-base-url`, and `--3p-model`
 environment variable for the API key so it does not appear in shell history or process arguments.
 The `.cmd` launcher works even when direct PowerShell script execution is disabled and does not
 change the machine's persistent execution policy.
+
+For the verified Windows workflow used to reproduce the Qwen2.5-14B AMC23 result, including
+model/dataset switching, preflight checks, resume behavior, and result inspection, see
+[`API_EXPERIMENT_GUIDE.zh-CN.md`](API_EXPERIMENT_GUIDE.zh-CN.md).
 
 **Baselines:**
 

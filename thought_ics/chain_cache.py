@@ -22,7 +22,8 @@ def get_cache_key(
     temperature: float,
     max_depth: int,
     max_tokens_per_thought: int,
-    model_seed: Optional[int] = None
+    model_seed: Optional[int] = None,
+    prompt_profile: Optional[str] = None,
 ) -> str:
     """Generate cache key from config parameters including model name.
 
@@ -34,6 +35,8 @@ def get_cache_key(
     # Only append model_seed if explicitly set (backward compatibility)
     if model_seed is not None:
         config_str += f"_mseed{model_seed}"
+    if prompt_profile is not None:
+        config_str += f"_prompt_{prompt_profile}"
 
     # Use hash for shorter filenames
     return hashlib.md5(config_str.encode()).hexdigest()
@@ -62,14 +65,18 @@ def save_initial_chains(
     max_depth: int,
     max_tokens_per_thought: int,
     model_seed: Optional[int] = None,
-    cache_type: str = "tot"
+    cache_type: str = "tot",
+    prompt_profile: Optional[str] = None,
 ) -> None:
     """Save initial chains to cache with metadata.
 
     Args:
         cache_type: Either "tot" for ToT chains or "cot" for CoT chains
     """
-    cache_key = get_cache_key(model_name, dataset_name, n_problems, seed, temperature, max_depth, max_tokens_per_thought, model_seed)
+    cache_key = get_cache_key(
+        model_name, dataset_name, n_problems, seed, temperature, max_depth,
+        max_tokens_per_thought, model_seed, prompt_profile
+    )
     cache_path = get_cache_path(cache_key, cache_type)
 
     cache_data = {
@@ -82,6 +89,7 @@ def save_initial_chains(
             'max_depth': max_depth,
             'max_tokens_per_thought': max_tokens_per_thought,
             'model_seed': model_seed,
+            'prompt_profile': prompt_profile,
             'cache_key': cache_key,
             'num_chains': len(chains),
             'complete': len(chains) == n_problems,
@@ -113,6 +121,7 @@ def load_initial_chains(
     model_seed: Optional[int] = None,
     cache_type: str = "tot",
     allow_partial: bool = False,
+    prompt_profile: Optional[str] = None,
 ) -> Optional[List[Dict]]:
     """Load initial chains from cache if they exist.
 
@@ -120,7 +129,10 @@ def load_initial_chains(
         cache_type: Either "tot" for ToT chains or "cot" for CoT chains
         allow_partial: Return a valid prefix cache for resumable generation
     """
-    cache_key = get_cache_key(model_name, dataset_name, n_problems, seed, temperature, max_depth, max_tokens_per_thought, model_seed)
+    cache_key = get_cache_key(
+        model_name, dataset_name, n_problems, seed, temperature, max_depth,
+        max_tokens_per_thought, model_seed, prompt_profile
+    )
     cache_path = get_cache_path(cache_key, cache_type)
 
     if not cache_path.exists():
@@ -139,7 +151,8 @@ def load_initial_chains(
         metadata['temperature'] == temperature and
         metadata['max_depth'] == max_depth and
         metadata['max_tokens_per_thought'] == max_tokens_per_thought and
-        metadata.get('model_seed') == model_seed):
+        metadata.get('model_seed') == model_seed and
+        metadata.get('prompt_profile') == prompt_profile):
 
         chains = cache_data['chains']
         empty_chain_ids = [

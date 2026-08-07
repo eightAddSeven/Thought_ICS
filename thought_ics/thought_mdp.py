@@ -151,7 +151,8 @@ class ToTAgent:
         top_p: float = 0.9,
         top_k: int = 50,
         min_tokens: int = 5,
-        stop_sequences: Optional[List[str]] = None
+        stop_sequences: Optional[List[str]] = None,
+        strip_leading_thought_number: bool = False,
     ):
         """
         Initialize the ToT agent.
@@ -164,6 +165,8 @@ class ToTAgent:
             top_k: Top-k sampling parameter
             min_tokens: Minimum tokens to generate
             stop_sequences: Stop tokens for generation
+            strip_leading_thought_number: Remove a generated ``"N. "`` prefix
+                before storing a thought; used by the numbered paper profile
         """
         self.model_manager = model_manager
         self.temperature = temperature
@@ -173,6 +176,7 @@ class ToTAgent:
         self.min_tokens = min_tokens
         # Default: stop only on the thought delimiter (paper also stopped on "\n\n").
         self.stop_sequences = stop_sequences or [recommended_prompts.THOUGHT_DELIMITER]
+        self.strip_leading_thought_number = strip_leading_thought_number
 
         # Statistics
         self.total_generations = 0
@@ -300,6 +304,8 @@ class ToTAgent:
             Parsed action with thought and terminal flag
         """
         thought = output.strip()
+        if self.strip_leading_thought_number:
+            thought = re.sub(r"^\s*\d+\.\s+", "", thought, count=1)
 
         # Check if this is a terminal thought (contains \boxed{})
         is_terminal = '\\boxed{' in thought
@@ -338,9 +344,10 @@ class ToTEnvironment:
 
     def __init__(
         self,
-        max_depth: int = recommended_prompts.RECOMMENDED_MAX_THOUGHTS,  # 20 (paper: 15)
+        max_depth: int = recommended_prompts.RECOMMENDED_MAX_THOUGHTS,  # 20 (paper: 100)
         prompt_template: Optional[str] = None,
-        reward_fn: Optional[Callable[[ToTState, ToTAction, ToTState], float]] = None
+        reward_fn: Optional[Callable[[ToTState, ToTAction, ToTState], float]] = None,
+        number_thoughts: bool = False,
     ):
         """
         Initialize the ToT environment.
@@ -349,9 +356,11 @@ class ToTEnvironment:
             max_depth: Maximum depth of reasoning tree
             prompt_template: Template for constructing prompts (None = use default)
             reward_fn: Custom reward function (None = use default)
+            number_thoughts: Prefix each appended thought with its 1-based index
         """
         self.max_depth = max_depth
         self.prompt_template = prompt_template or self._default_prompt_template()
+        self.number_thoughts = number_thoughts
         self.reward_fn = reward_fn or self._default_reward
 
         # Tree management
@@ -519,8 +528,9 @@ class ToTEnvironment:
         prompt = self.prompt_template.format(question=state.question)
 
         # Append thought history
-        for thought in state.thought_history:
-            prompt += f"{thought}</thought>\n"
+        for index, thought in enumerate(state.thought_history, 1):
+            prefix = f"{index}. " if self.number_thoughts else ""
+            prompt += f"{prefix}{thought}</thought>\n"
 
         return prompt
 

@@ -538,14 +538,25 @@ def compute_metrics(experiment_dir: Path) -> Dict[str, Any]:
 
         # Overall performance (derived from trajectory)
         first_iter = trajectory["by_iteration"].get("iter_0", {})
-        last_iter_key = max(
-            trajectory["by_iteration"].keys(),
-            key=lambda key: int(key.rsplit("_", 1)[1])
-        )
-        last_iter = trajectory["by_iteration"][last_iter_key]
-
         first_acc = first_iter.get("accuracy", 0.0)
-        final_acc = last_iter.get("accuracy", 0.0)
+        completed_results = [
+            problem for problem in results_list
+            if problem.get(iter_key)
+        ]
+        final_correct = sum(
+            bool(problem.get(
+                "final_correct",
+                problem.get(
+                    "success",
+                    problem[iter_key][-1].get("correct", False)
+                )
+            ))
+            for problem in completed_results
+        )
+        final_acc = (
+            round(final_correct / len(completed_results), 4)
+            if completed_results else 0.0
+        )
 
         metrics["overall_performance"] = {
             "_description": "High-level accuracy metrics",
@@ -553,8 +564,69 @@ def compute_metrics(experiment_dir: Path) -> Dict[str, Any]:
             "final_accuracy": final_acc,
             "absolute_improvement": round(final_acc - first_acc, 4),
             "relative_improvement": round((final_acc - first_acc) / first_acc, 4) if first_acc > 0 else 0.0,
-            "_note": "relative_improvement = absolute_improvement / first_attempt_accuracy"
+            "_note": (
+                "final_accuracy uses each problem's selected final outcome; "
+                "for Thought-ICS-A this includes confidence-safeguard resets. "
+                "relative_improvement = absolute_improvement / first_attempt_accuracy"
+            )
         }
+
+        variant_results = [
+            problem for problem in completed_results
+            if "thought_ics_s_correct" in problem
+            and "thought_ics_a_correct" in problem
+        ]
+        if variant_results:
+            paired_total = len(variant_results)
+            s_correct = sum(
+                bool(problem["thought_ics_s_correct"])
+                for problem in variant_results
+            )
+            a_correct = sum(
+                bool(problem["thought_ics_a_correct"])
+                for problem in variant_results
+            )
+            a_better = sum(
+                bool(problem["thought_ics_a_correct"])
+                and not bool(problem["thought_ics_s_correct"])
+                for problem in variant_results
+            )
+            s_better = sum(
+                bool(problem["thought_ics_s_correct"])
+                and not bool(problem["thought_ics_a_correct"])
+                for problem in variant_results
+            )
+            termination_counts = {}
+            for problem in variant_results:
+                reason = problem.get("termination_reason", "unknown")
+                termination_counts[reason] = termination_counts.get(reason, 0) + 1
+
+            metrics["autonomous_variant_comparison"] = {
+                "_description": (
+                    "Paired Thought-ICS-S versus Thought-ICS-A outcomes from "
+                    "the same autonomous correction trajectories"
+                ),
+                "evaluated_problems": paired_total,
+                "thought_ics_s": {
+                    "correct": s_correct,
+                    "accuracy": round(s_correct / paired_total, 4),
+                },
+                "thought_ics_a": {
+                    "correct": a_correct,
+                    "accuracy": round(a_correct / paired_total, 4),
+                },
+                "a_minus_s": round((a_correct - s_correct) / paired_total, 4),
+                "paired_changes": {
+                    "a_better_than_s": a_better,
+                    "s_better_than_a": s_better,
+                    "same_outcome": paired_total - a_better - s_better,
+                },
+                "termination_counts": termination_counts,
+                "_note": (
+                    "Thought-ICS-A keeps verified-accuracy exits and resets "
+                    "V/L-disagreement or MaxIter exits to iteration zero."
+                ),
+            }
 
         metrics["accuracy_trajectory"] = trajectory
         metrics["iteration_transitions"] = compute_iteration_transitions(results_list, iter_key)

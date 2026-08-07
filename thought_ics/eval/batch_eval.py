@@ -31,10 +31,11 @@ from thought_ics.self_correction import (
     identify_error_step_with_mv,
     generate_from_prefix,
     extract_boxed_answer,
-    verify_solution_correctness
+    verify_solution_correctness,
 )
 from thought_ics.chain_cache import save_initial_chains, load_initial_chains
 from thought_ics.datasets import load_dataset_by_name, get_dataset_info, normalize_answer
+from thought_ics.prompt_profiles import get_prompt_profile
 # Weights & Biases，简称 WandB，是实验追踪平台
 from thought_ics.utils.wandb_utils import (
     WandbConfig, init_wandb_run, log_metrics,
@@ -71,9 +72,14 @@ def generate_or_load_initial_chains(
     max_tokens_per_thought: int,
     n_problems: int,
     seed: int,
-    model_seed: Optional[int] = None
+    model_seed: Optional[int] = None,
+    prompt_profile: str = "recommended",
 ) -> List[Dict]:
     """Generate initial chains or load from cache."""
+    profile = get_prompt_profile(
+        prompt_profile,
+        max_tokens_per_thought=max_tokens_per_thought,
+    )
 
     # Try to load from cache
     cached_chains = load_initial_chains(
@@ -86,6 +92,7 @@ def generate_or_load_initial_chains(
         max_tokens_per_thought=max_tokens_per_thought,
         model_seed=model_seed,
         allow_partial=True,
+        prompt_profile=profile.cache_tag,
     )
 
     if cached_chains is not None:
@@ -126,8 +133,18 @@ def generate_or_load_initial_chains(
 
         # 每道题有自己的 Agent 统计和状态
         # 远程 API 客户端配置保持相同,manager相同
-        agent = ToTAgent(manager, temperature=temperature, max_tokens=max_tokens_per_thought)
-        env = ToTEnvironment(max_depth=max_depth)
+        agent = ToTAgent(
+            manager,
+            temperature=temperature,
+            max_tokens=profile.max_tokens_per_thought,
+            stop_sequences=list(profile.stop_sequences),
+            strip_leading_thought_number=profile.number_thoughts,
+        )
+        env = ToTEnvironment(
+            max_depth=max_depth,
+            prompt_template=profile.generation_prompt,
+            number_thoughts=profile.number_thoughts,
+        )
         search = TreeSearch(agent, env, strategy="dfs", n_rollouts=1)
 
         root = search.search(item['problem'], verbose=False)
@@ -148,7 +165,7 @@ def generate_or_load_initial_chains(
             'problem_number': idx + 1,
             'chain': chain,
             'answer': answer,
-            'correct': answer == item['answer']
+            'correct': answer == item['answer'],
         })
 
         logger.info(f"Problem {idx+1}: Generated chain with {len(chain)} steps, answer: {answer}, correct: {answer == item['answer']}")
@@ -162,7 +179,8 @@ def generate_or_load_initial_chains(
             temperature=temperature,
             max_depth=max_depth,
             max_tokens_per_thought=max_tokens_per_thought,
-            model_seed=model_seed
+            model_seed=model_seed,
+            prompt_profile=profile.cache_tag,
         )
 
     return initial_chains
@@ -191,7 +209,9 @@ def run_iterative_correction_with_cached_chain(
     mv_criterion: str = "unanimous", # 如何根据多个结果决定是否认为答案正确
     use_mv_localization: bool = False, # 多数投票错误定位
     mv_localization_k: int = 10,
-    mv_localization_temp: float = 0.5
+    mv_localization_temp: float = 0.5,
+    confidence_safeguard: bool = False,
+    prompt_profile: str = "recommended",
 ) -> Dict:
     """Run iterative correction starting from a cached initial chain.
 
@@ -204,11 +224,17 @@ def run_iterative_correction_with_cached_chain(
         api_key_3p: API key for 3rd-party service
         model_3p: Model to use for 3rd-party inference
         base_url_3p: Optional OpenAI-compatible API base URL
+        confidence_safeguard: Select the Thought-ICS-A final answer. On the
+            low-confidence V/L-disagreement and MaxIter exits, reset to the
+            initial response instead of returning the last correction.
+        prompt_profile: "recommended" for the refined repository defaults or
+            "paper" for the original published prompts/protocol.
     """
 
     iterations = []
     chain = initial_chain
     answer = extract_boxed_answer(chain[-1] if chain else "")
+    termination_reason = None
 
     iterations.append({
         'iteration': 0, # 表示还没有纠错，是初始模型输出
@@ -237,6 +263,7 @@ def run_iterative_correction_with_cached_chain(
             and normalize_answer(answer) == normalize_answer(ground_truth)
         ):
             logger.info(f"SUCCESS! Correct answer found at iteration {i-1}")
+            termination_reason = "oracle_correct"
             break
 
         # Optional verification: ask model if it thinks answer is correct
@@ -258,6 +285,7 @@ def run_iterative_correction_with_cached_chain(
 
             if believes_correct:
                 logger.info(f"Model believes answer is correct - stopping iteration.")
+                termination_reason = "verified_accuracy"
                 iterations.append({
                     'iteration': i,
                     'chain': chain,
@@ -281,7 +309,9 @@ def run_iterative_correction_with_cached_chain(
             # Use majority vote localization
             error_step, error_reasoning, all_localization_decisions = identify_error_step_with_mv(
                 manager, problem, chain, ground_truth, autonomy_level,
-                temperature=mv_localization_temp, mv_k=mv_localization_k
+                temperature=mv_localization_temp,
+                mv_k=mv_localization_k,
+                prompt_profile=prompt_profile,
             )
         elif use_3p_localize:
             # Use 3rd-party API for error localization
@@ -294,12 +324,29 @@ def run_iterative_correction_with_cached_chain(
         elif error_detection_method == 'incremental':
             error_step, error_reasoning = identify_error_step_incremental(manager, problem, chain, ground_truth, autonomy_level, temperature=judge_temp)
         else:  # default: 'batch'
-            error_step, error_reasoning = identify_error_step(manager, problem, chain, ground_truth, autonomy_level, temperature=judge_temp)
+            error_step, error_reasoning = identify_error_step(
+                manager,
+                problem,
+                chain,
+                ground_truth,
+                autonomy_level,
+                temperature=judge_temp,
+                prompt_profile=prompt_profile,
+            )
 
         # Check if model found no errors
         if error_step == 0:
             is_correct = normalize_answer(answer) == normalize_answer(ground_truth)
             logger.info(f"Model found no errors - stopping iteration. Answer correct: {is_correct}")
+            # With an explicit verifier, reaching localization means verification
+            # already flagged an error. A zero localization decision is therefore
+            # the paper's V/L-disagreement exit. Without --verify it is simply the
+            # joint L3 localizer accepting the response.
+            termination_reason = (
+                "v_l_disagreement"
+                if verify and iter_model_believes_correct is False
+                else "localizer_no_error"
+            )
             iterations.append({
                 'iteration': i,
                 'chain': chain,
@@ -333,9 +380,16 @@ def run_iterative_correction_with_cached_chain(
                                         previous_chain=previous_chain,
                                         error_reasoning=previous_error_reasoning,
                                         error_step=error_step,
-                                        temperature=resample_temp)
+                                        temperature=resample_temp,
+                                        prompt_profile=prompt_profile)
         else:
-            chain = generate_from_prefix(manager, problem, prefix, temperature=resample_temp)
+            chain = generate_from_prefix(
+                manager,
+                problem,
+                prefix,
+                temperature=resample_temp,
+                prompt_profile=prompt_profile,
+            )
 
         answer = extract_boxed_answer(chain[-1] if chain else "")
 
@@ -360,17 +414,53 @@ def run_iterative_correction_with_cached_chain(
             and normalize_answer(answer) == normalize_answer(ground_truth)
         ):
             logger.info(f"SUCCESS! Correct answer found at iteration {i}")
+            termination_reason = "oracle_correct"
             break
 
-    final_correct = iterations[-1]['correct']
+    if termination_reason is None:
+        termination_reason = "max_iterations"
+
+    raw_final = iterations[-1]
+    initial = iterations[0]
+    low_confidence_exit = termination_reason in {
+        "v_l_disagreement",
+        "max_iterations",
+    }
+
+    # Thought-ICS-S always returns the terminal correction. Thought-ICS-A uses
+    # exactly the same trajectory, but resets low-confidence exits to iteration
+    # zero. Recording both outcomes makes a paired S/A comparison possible
+    # without paying for a second stochastic API run.
+    thought_ics_s_answer = raw_final["answer"]
+    thought_ics_s_correct = raw_final["correct"]
+    thought_ics_a_state = initial if low_confidence_exit else raw_final
+    thought_ics_a_answer = thought_ics_a_state["answer"]
+    thought_ics_a_correct = thought_ics_a_state["correct"]
+
+    safeguard_applied = confidence_safeguard and low_confidence_exit
+    selected_answer = (
+        thought_ics_a_answer if confidence_safeguard else thought_ics_s_answer
+    )
+    selected_correct = (
+        thought_ics_a_correct if confidence_safeguard else thought_ics_s_correct
+    )
 
     return {
         'problem': problem,
         'ground_truth': ground_truth,
         'iterations': iterations,
-        'success': final_correct,
+        'success': selected_correct,
+        'final_answer': selected_answer,
+        'final_correct': selected_correct,
+        'termination_reason': termination_reason,
+        'confidence_safeguard': confidence_safeguard,
+        'safeguard_applied': safeguard_applied,
+        'thought_ics_s_answer': thought_ics_s_answer,
+        'thought_ics_s_correct': thought_ics_s_correct,
+        'thought_ics_a_answer': thought_ics_a_answer,
+        'thought_ics_a_correct': thought_ics_a_correct,
         'total_iterations': max(0, len(iterations) - 1),
-        'states_recorded': len(iterations)
+        'states_recorded': len(iterations),
     }
 
 # 负责“整批题目的实验管理”
@@ -408,7 +498,9 @@ def run_batch_evaluation(
     mv_criterion: str = "unanimous",
     use_mv_localization: bool = False,
     mv_localization_k: int = 10,
-    mv_localization_temp: float = 0.5
+    mv_localization_temp: float = 0.5,
+    confidence_safeguard: bool = False,
+    prompt_profile: str = "recommended",
 ):
     """Run batch evaluation on problems with cached initial chains.
 
@@ -511,6 +603,19 @@ def run_batch_evaluation(
         'mv_verify': mv_verify,
         'mv_k': mv_k,
         'mv_criterion': mv_criterion,
+        'confidence_safeguard': confidence_safeguard,
+        'thought_ics_variant': (
+            'Thought-ICS-A' if confidence_safeguard else 'Thought-ICS-S'
+        ) if autonomy_level == 3 and verify else None,
+        'prompt_profile': prompt_profile,
+        'prompt_profile_cache_tag': get_prompt_profile(
+            prompt_profile,
+            max_tokens_per_thought=MAX_TOKENS_PER_THOUGHT,
+        ).cache_tag,
+        'profile_max_tokens_per_thought': get_prompt_profile(
+            prompt_profile,
+            max_tokens_per_thought=MAX_TOKENS_PER_THOUGHT,
+        ).max_tokens_per_thought,
         # MV localization settings
         'use_mv_localization': use_mv_localization,
         'mv_localization_k': mv_localization_k,
@@ -565,6 +670,7 @@ def run_batch_evaluation(
     logger.info(f"Generation temperature: {generation_temp}")
     logger.info(f"Resample temperature: {resample_temp}")
     logger.info(f"Judge temperature: {judge_temp}")
+    logger.info(f"Prompt profile: {prompt_profile}")
     logger.info(f"Max depth: {MAX_DEPTH}")
     logger.info(f"Max tokens per thought: {MAX_TOKENS_PER_THOUGHT}")
     logger.info("="*100)
@@ -610,7 +716,8 @@ def run_batch_evaluation(
         max_tokens_per_thought=MAX_TOKENS_PER_THOUGHT,
         n_problems=n_problems,
         seed=seed,
-        model_seed=model_seed
+        model_seed=model_seed,
+        prompt_profile=prompt_profile,
     )
 
     # Check for existing progress (resume capability)
@@ -699,7 +806,9 @@ def run_batch_evaluation(
                 mv_criterion=mv_criterion,
                 use_mv_localization=use_mv_localization,
                 mv_localization_k=mv_localization_k,
-                mv_localization_temp=mv_localization_temp
+                mv_localization_temp=mv_localization_temp,
+                confidence_safeguard=confidence_safeguard,
+                prompt_profile=prompt_profile,
             )
 
             result['problem_id'] = item['unique_id']
@@ -724,7 +833,7 @@ def run_batch_evaluation(
                 log_problem_result(
                     problem_id=item['unique_id'],
                     problem_number=problem_num,
-                    predicted_answer=result['iterations'][-1]['answer'],
+                    predicted_answer=result['final_answer'],
                     ground_truth=item['answer'],
                     correct=result['success'],
                     iterations=result['total_iterations'],
@@ -763,6 +872,45 @@ def run_batch_evaluation(
     stats['avg_iterations'] = stats['total_iterations'] / stats['total_problems'] if stats['total_problems'] > 0 else 0
     stats['success_rate'] = (stats['successful'] / stats['total_problems']) * 100 if stats['total_problems'] > 0 else 0
 
+    # Thought-ICS-A is a deterministic confidence-safeguard projection of the
+    # Thought-ICS-S trajectories, not a second sampling method. Report both on
+    # the same trajectories for a controlled paired comparison.
+    comparable_results = [
+        result for result in results
+        if not result.get('error')
+        and 'thought_ics_s_correct' in result
+        and 'thought_ics_a_correct' in result
+    ]
+    if autonomy_level == 3 and verify and comparable_results:
+        s_correct = sum(
+            bool(result['thought_ics_s_correct'])
+            for result in comparable_results
+        )
+        a_correct = sum(
+            bool(result['thought_ics_a_correct'])
+            for result in comparable_results
+        )
+        paired_total = len(comparable_results)
+        stats['autonomous_variant_comparison'] = {
+            'evaluated_problems': paired_total,
+            'thought_ics_s_correct': s_correct,
+            'thought_ics_s_accuracy': s_correct / paired_total,
+            'thought_ics_a_correct': a_correct,
+            'thought_ics_a_accuracy': a_correct / paired_total,
+            'a_minus_s': (a_correct - s_correct) / paired_total,
+            'low_confidence_exit_count': sum(
+                result['termination_reason'] in {
+                    'v_l_disagreement',
+                    'max_iterations',
+                }
+                for result in comparable_results
+            ),
+            'safeguard_applied_count': sum(
+                bool(result.get('safeguard_applied'))
+                for result in comparable_results
+            ),
+        }
+
     # Save results
     results_file = exp_dir / "results.json"
     full_results = {
@@ -782,6 +930,24 @@ def run_batch_evaluation(
     logger.info(f"Success rate: {stats['success_rate']:.2f}%")
     logger.info(f"Average iterations: {stats['avg_iterations']:.2f}")
     logger.info(f"Total iterations: {stats['total_iterations']}")
+    variant_comparison = stats.get('autonomous_variant_comparison')
+    if variant_comparison:
+        logger.info(
+            "Thought-ICS-S accuracy: "
+            f"{variant_comparison['thought_ics_s_accuracy']:.2%} "
+            f"({variant_comparison['thought_ics_s_correct']}/"
+            f"{variant_comparison['evaluated_problems']})"
+        )
+        logger.info(
+            "Thought-ICS-A accuracy: "
+            f"{variant_comparison['thought_ics_a_accuracy']:.2%} "
+            f"({variant_comparison['thought_ics_a_correct']}/"
+            f"{variant_comparison['evaluated_problems']})"
+        )
+        logger.info(
+            "Thought-ICS-A minus S: "
+            f"{variant_comparison['a_minus_s']:+.2%}"
+        )
     logger.info(f"\nResults saved to: {exp_dir}")
     logger.info(f"  - Config: {config_file}")
     logger.info(f"  - Results: {results_file}")
@@ -884,6 +1050,12 @@ def main():
                         help='Temperature for correction/regeneration (no cache impact) (default: 0.7)')
     parser.add_argument('--judge-temp', type=float, default=0.3,
                         help='Temperature for error detection/verification (no cache impact) (default: 0.3)')
+    parser.add_argument('--prompt-profile', type=str,
+                        choices=['recommended', 'paper'],
+                        default='recommended',
+                        help='Prompt/protocol profile: recommended=refined repository '
+                             'defaults; paper=original published prompts, stop sequences, '
+                             'and per-thought token limit (default: recommended)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for dataset sampling and reproducibility (default: 42)')
     parser.add_argument('--model-seed', type=int, default=None,
@@ -902,6 +1074,10 @@ def main():
                              '(default: OPENAI_MODEL env var, then gpt-4o)')
     parser.add_argument('--verify', action='store_true',
                         help='Enable solution verification before error detection (L3 only)')
+    parser.add_argument('--confidence-safeguard', action='store_true',
+                        help='Select Thought-ICS-A final answers: with L3 --verify, reset '
+                             'V/L-disagreement and MaxIter exits to the initial response. '
+                             'The results always report paired S and A accuracies.')
     parser.add_argument('--mv', action='store_true',
                         help='Enable majority vote verification (requires --verify)')
     parser.add_argument('--k', type=int, default=5,
@@ -921,6 +1097,12 @@ def main():
     # Validation: --mv requires --verify
     if args.mv and not args.verify:
         raise ValueError("--mv requires --verify to be enabled")
+    if args.confidence_safeguard and (
+        args.autonomy_level != 3 or not args.verify
+    ):
+        parser.error(
+            "--confidence-safeguard requires --autonomy-level 3 and --verify"
+        )
 
     # Historical-context conditioning is orthogonal to the oracle level: it lives on --context
     # and combines with any autonomy level (1/2/3).
@@ -983,7 +1165,9 @@ def main():
         mv_criterion=args.mv_criterion,
         use_mv_localization=args.mv_localization,
         mv_localization_k=args.mv_localization_k,
-        mv_localization_temp=args.mv_localization_temp
+        mv_localization_temp=args.mv_localization_temp,
+        confidence_safeguard=args.confidence_safeguard,
+        prompt_profile=args.prompt_profile,
     )
 
 

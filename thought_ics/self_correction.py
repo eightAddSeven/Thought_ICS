@@ -24,11 +24,11 @@ from thought_ics.thought_mdp import (
     initialize_model, get_completed_paths
 )
 from thought_ics.datasets import normalize_answer
-from thought_ics import recommended_prompts  # active default localization prompts (L1/L2)
+from thought_ics import paper_prompts, recommended_prompts
+from thought_ics.prompt_profiles import get_prompt_profile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 def extract_boxed_answer(text: str) -> str:
     """Extract answer from \\boxed{} format."""
@@ -53,6 +53,48 @@ def extract_boxed_answer(text: str) -> str:
         return text[start_pos:i-1].strip()
 
     return "NO ANSWER"
+
+
+def _parse_localization_step(response: str, chain_length: int) -> int:
+    """Parse a localization decision using the Appendix E.4 rules.
+
+    Prefer the last boxed value. If it is unavailable, fall back to the last
+    integer in the response. Values above the chain length are clamped to the
+    final step; zero remains the autonomous "no error" decision.
+    """
+    if chain_length <= 0:
+        return 0
+
+    step_str = extract_boxed_answer(response)
+    try:
+        raw_step = int(step_str)
+        source = "boxed answer"
+    except (ValueError, TypeError):
+        numbers = re.findall(r"\d+", response)
+        if not numbers:
+            fallback = max(1, chain_length // 2)
+            logger.warning(
+                "Could not parse any localization integer; "
+                f"defaulting to middle step {fallback}"
+            )
+            return fallback
+        raw_step = int(numbers[-1])
+        source = "last integer fallback"
+
+    if raw_step == 0:
+        return 0
+
+    clamped_step = min(max(raw_step, 1), chain_length)
+    if clamped_step != raw_step:
+        logger.warning(
+            f"Localization decision {raw_step} from {source} is outside "
+            f"1..{chain_length}; clamping to step {clamped_step}"
+        )
+    elif source != "boxed answer":
+        logger.warning(
+            f"No valid boxed localization; using last integer {clamped_step}"
+        )
+    return clamped_step
 
 
 def generate_full_chain(manager, problem: str, temperature: float = 1.0, max_depth: int = 100, max_tokens_per_thought: int = 150) -> List[str]:
@@ -235,7 +277,15 @@ def identify_error_step_incremental(manager, problem: str, chain: List[str], gro
     return 0, full_reasoning
 
 
-def identify_error_step(manager, problem: str, chain: List[str], ground_truth: str, autonomy_level: int = 1, temperature: float = 0.3) -> Tuple[int, str]:
+def identify_error_step(
+    manager,
+    problem: str,
+    chain: List[str],
+    ground_truth: str,
+    autonomy_level: int = 1,
+    temperature: float = 0.3,
+    prompt_profile: str = "recommended",
+) -> Tuple[int, str]:
     """Ask model to identify which step contains the error with reasoning.
 
     Args:
@@ -255,7 +305,14 @@ def identify_error_step(manager, problem: str, chain: List[str], ground_truth: s
     for i, step in enumerate(chain, 1):
         chain_text += f"\nStep {i}: {step}"
 
-    if autonomy_level == 1:
+    if prompt_profile == "paper":
+        prompt = paper_prompts.localization_prompt(
+            problem,
+            chain,
+            ground_truth=ground_truth,
+            autonomy_level=autonomy_level,
+        )
+    elif autonomy_level == 1:
         # L1: Oracle access - model sees correct answer.
         # Default: recommended localizer. Paper version: thought_ics.paper_prompts.
         prompt = recommended_prompts.localization_prompt(problem, chain, ground_truth=ground_truth)
@@ -289,32 +346,12 @@ Provide your reasoning and analysis. Then conclude with:
     response = outputs[0].strip()
     logger.info(f"Model response: {response}")
 
-    # Extract step number from boxed answer
-    step_str = extract_boxed_answer(response)
-
-    # Try to parse as integer
-    try:
-        step_num = int(step_str)
-        if step_num == 0:
-            logger.info("Model found no errors in the chain")
-            return 0, response
-        elif 1 <= step_num <= len(chain):
-            logger.info(f"Identified error at step {step_num}")
-            return step_num, response
-    except (ValueError, TypeError):
-        logger.warning(f"Could not parse step number from boxed answer '{step_str}'")
-
-    # Fallback: try to find any number in response
-    numbers = re.findall(r'\d+', response)
-    if numbers:
-        step_num = int(numbers[0])
-        if 1 <= step_num <= len(chain):
-            logger.warning(f"No valid boxed answer, using first number found: {step_num}")
-            return step_num, response
-
-    # Default to middle of chain if can't parse
-    logger.warning(f"Could not parse step number from response, defaulting to middle")
-    return max(1, len(chain) // 2), response
+    step_num = _parse_localization_step(response, len(chain))
+    if step_num == 0:
+        logger.info("Model found no errors in the chain")
+    else:
+        logger.info(f"Identified error at step {step_num}")
+    return step_num, response
 
 # 对同一条推理链做多次错误定位，然后多数投票
 def identify_error_step_with_mv(
@@ -324,7 +361,8 @@ def identify_error_step_with_mv(
     ground_truth: str,
     autonomy_level: int = 1,
     temperature: float = 0.5,
-    mv_k: int = 10
+    mv_k: int = 10,
+    prompt_profile: str = "recommended",
 ) -> Tuple[int, str, List[Optional[int]]]:
     """Majority vote variant of identify_error_step.
 
@@ -354,7 +392,14 @@ def identify_error_step_with_mv(
         chain_text += f"\nStep {i}: {step}"
 
     # Build prompt based on autonomy level (same as identify_error_step)
-    if autonomy_level == 1:
+    if prompt_profile == "paper":
+        prompt = paper_prompts.localization_prompt(
+            problem,
+            chain,
+            ground_truth=ground_truth,
+            autonomy_level=autonomy_level,
+        )
+    elif autonomy_level == 1:
         prompt = f"""Problem: {problem}
 
 Current reasoning chain (WRONG - got incorrect answer):
@@ -408,38 +453,9 @@ Provide your reasoning and analysis. Then conclude with:
         response = response.strip()
         all_reasonings.append(f"--- Rollout {i+1} ---\n{response}")
 
-        # Extract step number from boxed answer
-        step_str = extract_boxed_answer(response)
-
-        # Try to parse as integer
-        try:
-            step_num = int(step_str)
-            if step_num == 0:
-                all_decisions.append(0)
-            elif 1 <= step_num <= len(chain):
-                all_decisions.append(step_num)
-            else:
-                # Out of range - fallback to finding any number
-                numbers = re.findall(r'\d+', response)
-                if numbers:
-                    fallback = int(numbers[0])
-                    if 1 <= fallback <= len(chain):
-                        all_decisions.append(fallback)
-                    else:
-                        all_decisions.append(None)
-                else:
-                    all_decisions.append(None)
-        except (ValueError, TypeError):
-            # Fallback: try to find any number in response
-            numbers = re.findall(r'\d+', response)
-            if numbers:
-                fallback = int(numbers[0])
-                if 0 <= fallback <= len(chain):
-                    all_decisions.append(fallback)
-                else:
-                    all_decisions.append(None)
-            else:
-                all_decisions.append(None)
+        all_decisions.append(
+            _parse_localization_step(response, len(chain))
+        )
 
     # Compute majority vote (filter out None values)
     valid_decisions = [d for d in all_decisions if d is not None]
@@ -584,7 +600,16 @@ Conclude with \\boxed{{YES}} if the solution is correct, or \\boxed{{NO}} if it 
         return False, response
 
 
-def generate_from_prefix(manager, problem: str, prefix: List[str], previous_chain: Optional[List[str]] = None, error_reasoning: Optional[str] = None, error_step: Optional[int] = None, temperature: float = 0.7) -> List[str]:
+def generate_from_prefix(
+    manager,
+    problem: str,
+    prefix: List[str],
+    previous_chain: Optional[List[str]] = None,
+    error_reasoning: Optional[str] = None,
+    error_step: Optional[int] = None,
+    temperature: float = 0.7,
+    prompt_profile: str = "recommended",
+) -> List[str]:
     """Generate new chain from a given prefix.
 
     Args:
@@ -620,8 +645,22 @@ def generate_from_prefix(manager, problem: str, prefix: List[str], previous_chai
         if previous_chain is None or error_reasoning is None:
             logger.info("Regenerating from scratch...")
 
-    agent = ToTAgent(manager, temperature=temperature, max_tokens=150)
-    env = ToTEnvironment(max_depth=100)
+    profile = get_prompt_profile(
+        prompt_profile,
+        max_tokens_per_thought=150,
+    )
+    agent = ToTAgent(
+        manager,
+        temperature=temperature,
+        max_tokens=profile.max_tokens_per_thought,
+        stop_sequences=list(profile.stop_sequences),
+        strip_leading_thought_number=profile.number_thoughts,
+    )
+    env = ToTEnvironment(
+        max_depth=100,
+        prompt_template=profile.generation_prompt,
+        number_thoughts=profile.number_thoughts,
+    )
     search = TreeSearch(agent, env, strategy="dfs", n_rollouts=1)
 
     root = search.search(prompt, verbose=False, initial_thoughts=prefix)

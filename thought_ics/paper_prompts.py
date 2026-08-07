@@ -7,15 +7,19 @@ the original setup remains available for inspection or exact reproduction of the
 
 To reproduce the paper exactly, pass these explicitly, e.g.:
     from thought_ics import paper_prompts
-    env = ToTEnvironment(max_depth=15, prompt_template=paper_prompts.GENERATION_PROMPT)
+    env = ToTEnvironment(
+        max_depth=paper_prompts.PAPER_MAX_DEPTH,
+        prompt_template=paper_prompts.GENERATION_PROMPT,
+        number_thoughts=True,
+    )
 and use ``paper_prompts.localization_prompt(...)`` in place of the default localizer.
 """
 
 from typing import List
 
-# Paper defaults (for reference): generation used in-context examples, a 15-step depth cap,
-# and stop sequences ["</thought>", "\n\n"].
-PAPER_MAX_DEPTH = 15
+# Paper defaults from Appendix E.4-E.5: generation used in-context examples,
+# a 100-step depth cap, and stop sequences ["</thought>", "\n\n"].
+PAPER_MAX_DEPTH = 100
 PAPER_MAX_TOKENS_PER_THOUGHT = 150
 PAPER_STOP_SEQUENCES = ["</thought>", "\n\n"]
 
@@ -30,22 +34,24 @@ Instructions:
 Examples:
 
 Q: In how many ways can 5 distinct books be arranged on a shelf if 2 specific books must not be adjacent?
-Total arrangements without restrictions is 5! = 120</thought>
-I need to subtract arrangements where the 2 specific books ARE adjacent</thought>
-If I treat the 2 books as a single unit, I have 4 units to arrange: 4! = 24 ways</thought>
-The 2 books within their unit can be arranged in 2! = 2 ways</thought>
-So arrangements with the books adjacent = 24 × 2 = 48</thought>
-Therefore, arrangements where they are NOT adjacent = 120 - 48 = \\boxed{{72}}</thought>
+1. Total arrangements without restrictions is 5! = 120</thought>
+2. I need to subtract arrangements where the 2 specific books ARE adjacent</thought>
+3. If I treat the 2 books as a single unit, I have 4 units to arrange: 4! = 24 ways</thought>
+4. The 2 books within their unit can be arranged in 2! = 2 ways</thought>
+5. So arrangements with the books adjacent = 24 × 2 = 48</thought>
+6. Therefore, arrangements where they are NOT adjacent = 120 - 48 = \\boxed{{72}}</thought>
 
 Q: A rectangle has area 48 and perimeter 28. What is the length of its diagonal?
-Let length = l and width = w. From the area: lw = 48</thought>
-From the perimeter: 2l + 2w = 28, so l + w = 14</thought>
-From l + w = 14, we get w = 14 - l. Substituting into lw = 48: l(14 - l) = 48</thought>
-Expanding: 14l - l² = 48, so l² - 14l + 48 = 0. Factoring: (l - 6)(l - 8) = 0</thought>
-So l = 8 and w = 6 (or vice versa). Using the Pythagorean theorem: d² = 8² + 6² = 64 + 36 = 100</thought>
-Therefore d = 10, so the answer is \\boxed{{10}}</thought>
+1. Let length = l and width = w. From the area: lw = 48</thought>
+2. From the perimeter: 2l + 2w = 28, so l + w = 14</thought>
+3. From l + w = 14, we get w = 14 - l. Substituting into lw = 48: l(14 - l) = 48</thought>
+4. Expanding: 14l - l² = 48, so l² - 14l + 48 = 0. Factoring: (l - 6)(l - 8) = 0</thought>
+5. So l = 8 and w = 6 (or vice versa). Using the Pythagorean theorem: d² = 8² + 6² = 64 + 36 = 100</thought>
+6. Therefore d = 10, so the answer is \\boxed{{10}}</thought>
 
 Q: {question}
+
+Append thoughts in the current state, if any
 """
 
 
@@ -80,15 +86,12 @@ Your answer is incorrect. Analyze the reasoning chain step by step to identify w
 
 Provide your reasoning, then conclude with the step number in the format: \\boxed{{step_number}}
 """)
-    else:  # L3: autonomous — may report no error via \boxed{0}
-        return (f"""Problem: {problem}
-
-Current reasoning chain:
-{chain_text}
+    else:  # L3: exact Appendix E.2 autonomous localization prompt
+        return (f"""You are given a reasoning trace: {chain_text.strip()}
 
 Carefully verify your reasoning chain step by step. If you identify any errors (logical flaw, arithmetic error, or incorrect assumption), determine which step number (1 to {n}) contains the first critical error.
 
-Provide your reasoning and analysis. Then conclude with:
-- \\boxed{{step_number}} if you found an error
-- \\boxed{{0}} if the reasoning is correct
+Also provide your reasoning. Then conclude with:
+1. \\boxed{{step_number}} if you found an error
+2. \\boxed{{0}} if the reasoning is correct
 """)
